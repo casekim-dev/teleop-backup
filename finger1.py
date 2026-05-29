@@ -17,6 +17,8 @@ import websockets
 
 
 shared_xr_data = {"head": None, "left": None, "right": None}
+shared_ws_count = 0
+shared_ws_last_time = 0.0
 shared_foot_clutch = {"left": False, "right": False}
 
 
@@ -77,10 +79,12 @@ def foot_pedal_monitor(node_logger):
 
 
 async def ws_handler(websocket):
-    global shared_xr_data
+    global shared_xr_data, shared_ws_count, shared_ws_last_time
     try:
         async for message in websocket:
             shared_xr_data = json.loads(message)
+            shared_ws_count += 1
+            shared_ws_last_time = time.time()
     except websockets.exceptions.ConnectionClosed:
         pass
 
@@ -104,6 +108,12 @@ class FingerFootPoseNode(Node):
         self.rot_zero = {"left": None, "right": None}
         self.robot_zero = {"left": None, "right": None}
         self.prev_state = {"left": None, "right": None}
+        self.arm_zero_head_yaw = {"left": 0.0, "right": 0.0}
+        self.latest_head_yaw = 0.0
+        self.rotate_arm_with_head_yaw = bool(self.declare_parameter("rotate_arm_with_head_yaw", True).value)
+        self.rotate_orientation_with_head_yaw = bool(
+            self.declare_parameter("rotate_orientation_with_head_yaw", True).value
+        )
         self.last_arm_cmd = {
             "left": {"linear": (0.0, 0.0, 0.0), "angular": (0.0, 0.0, 0.0), "clutch": False, "mode": "init"},
             "right": {"linear": (0.0, 0.0, 0.0), "angular": (0.0, 0.0, 0.0), "clutch": False, "mode": "init"},
@@ -347,6 +357,11 @@ class FingerFootPoseNode(Node):
             return self.normalize_quat(self.quat_multiply(self.wrist_to_ee_offset, q_ros_wrist))
         return self.normalize_quat(self.quat_multiply(q_ros_wrist, self.wrist_to_ee_offset))
 
+    def rotate_xy(self, x, y, yaw):
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        return c * x - s * y, s * x + c * y
+
     def publish_zero_twist(self, twist_pub, side=None, mode="zero"):
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -395,6 +410,7 @@ class FingerFootPoseNode(Node):
                 trans = self.tf_buffer.lookup_transform(self.base_frame, ee_frame, rclpy.time.Time())
                 self.robot_zero[side] = trans.transform.translation
                 self.human_zero[side] = vr_pos
+                self.arm_zero_head_yaw[side] = self.latest_head_yaw
                 self.rot_zero[side] = vr_rot
                 self.prev_state[side] = {"rot": vr_rot}
                 self.publish_zero_twist(twist_pub, side, "clutch_on_zero")
@@ -427,9 +443,25 @@ class FingerFootPoseNode(Node):
             curr_trans = self.tf_buffer.lookup_transform(self.base_frame, ee_frame, rclpy.time.Time())
             curr_pos = curr_trans.transform.translation
 
-            target_x = self.robot_zero[side].x + (vr_pos["x"] - self.human_zero[side]["x"])
-            target_y = self.robot_zero[side].y + (vr_pos["y"] - self.human_zero[side]["y"])
-            target_z = self.robot_zero[side].z + (vr_pos["z"] - self.human_zero[side]["z"])
+            dx = vr_pos["x"] - self.human_zero[side]["x"]
+            dy = vr_pos["y"] - self.human_zero[side]["y"]
+            dz = vr_pos["z"] - self.human_zero[side]["z"]
+
+            base_x = self.robot_zero[side].x + dx
+            base_y = self.robot_zero[side].y + dy
+            target_z = self.robot_zero[side].z + dz
+
+            body_yaw_delta = -(self.latest_head_yaw - self.arm_zero_head_yaw[side])
+            if self.rotate_arm_with_head_yaw:
+                # Waist command is -head yaw, so rotate the arm target with the same commanded body yaw.
+                target_x, target_y = self.rotate_xy(base_x, base_y, body_yaw_delta)
+            else:
+                target_x, target_y = base_x, base_y
+
+            target_rot = vr_rot
+            if self.rotate_orientation_with_head_yaw:
+                q_body_yaw = self.quat_from_rpy(0.0, 0.0, body_yaw_delta)
+                target_rot = self.normalize_quat(self.quat_multiply(q_body_yaw, vr_rot))
 
             p_gain = 4.0
             msg = TwistStamped()
@@ -440,7 +472,7 @@ class FingerFootPoseNode(Node):
             msg.twist.linear.z = (target_z - curr_pos.z) * p_gain
 
             prev_rot = self.prev_state[side]["rot"]
-            wx, wy, wz = self.calc_angular_velocity(prev_rot, vr_rot, self.dt)
+            wx, wy, wz = self.calc_angular_velocity(prev_rot, target_rot, self.dt)
             a_gain = 2.0
             msg.twist.angular.x = float(wx * a_gain)
             msg.twist.angular.y = float(wy * a_gain)
@@ -453,7 +485,7 @@ class FingerFootPoseNode(Node):
                 "clutch": curr_clutch,
                 "mode": "active",
             }
-            self.prev_state[side]["rot"] = vr_rot
+            self.prev_state[side]["rot"] = target_rot
         except Exception:
             pass
 
@@ -463,6 +495,7 @@ class FingerFootPoseNode(Node):
         is_clutch_active = shared_foot_clutch["left"] or shared_foot_clutch["right"]
         mapped_q = self.map_vr_to_ros_quat(head_data["rot"])
         roll, pitch, yaw = self.euler_from_quaternion(mapped_q)
+        self.latest_head_yaw = yaw
 
         head_msg = JointTrajectory()
         head_msg.header.stamp = self.get_clock().now().to_msg()
@@ -829,17 +862,25 @@ class FingerFootPoseNode(Node):
         r_ang = self.last_arm_cmd["right"]["angular"]
         left_ang = [round(v, 4) for v in l_ang]
         right_ang = [round(v, 4) for v in r_ang]
+        ws_age = None if shared_ws_last_time <= 0.0 else round(time.time() - shared_ws_last_time, 2)
+        has_left = bool(shared_xr_data.get("left"))
+        has_right = bool(shared_xr_data.get("right"))
         self.get_logger().info(
-            "arm_orientation ang_base L=%s R=%s dom L/R=%s/%s mode L/R=%s/%s clutch L/R=%s/%s"
+            "teleop_status ws_count=%d ws_age=%s xr L/R=%s/%s clutch_raw L/R=%s/%s "
+            "arm_orientation ang_base L=%s R=%s dom L/R=%s/%s mode L/R=%s/%s"
             % (
+                shared_ws_count,
+                ws_age,
+                has_left,
+                has_right,
+                shared_foot_clutch["left"],
+                shared_foot_clutch["right"],
                 left_ang,
                 right_ang,
                 self.dominant_rotation_label(l_ang),
                 self.dominant_rotation_label(r_ang),
                 self.last_arm_cmd["left"]["mode"],
                 self.last_arm_cmd["right"]["mode"],
-                self.last_arm_cmd["left"]["clutch"],
-                self.last_arm_cmd["right"]["clutch"],
             )
         )
 
