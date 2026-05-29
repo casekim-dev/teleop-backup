@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>WebXR Hand Joint DOF Calibration v3</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: system-ui, sans-serif; }
+        #ARButton { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); padding: 12px 24px; font-size: 18px; font-weight: bold; border-radius: 8px; background: white; color: black; border: none; cursor: pointer; z-index: 999; }
+        #poseGuide { position: fixed; top: 18px; left: 50%; transform: translateX(-50%); width: min(92vw, 720px); padding: 14px 18px; border-radius: 8px; background: rgba(0,0,0,0.72); color: white; text-align: center; z-index: 998; }
+        #poseName { font-size: 28px; font-weight: 800; line-height: 1.15; }
+        #poseDetail { margin-top: 6px; font-size: 17px; opacity: 0.9; }
+        #poseTimer { margin-top: 8px; font-size: 22px; font-variant-numeric: tabular-nums; }
+    </style>
+</head>
+<body>
+    <div id="poseGuide">
+        <div id="poseName">Hand Joint DOF v3</div>
+        <div id="poseDetail">25-joint payload enabled. Follow each pose and hold steady.</div>
+        <div id="poseTimer">0.0s</div>
+    </div>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+        import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
+
+        // 🚨 IP 주소 본인 PC에 맞게 꼭 확인!
+        const socket = new WebSocket('ws://192.168.50.3:8765');
+        socket.onopen = () => console.log("🟢 웹소켓 연결 성공! Hand Joint DOF v3");
+
+        const poseNameEl = document.getElementById('poseName');
+        const poseDetailEl = document.getElementById('poseDetail');
+        const poseTimerEl = document.getElementById('poseTimer');
+        const POSE_SEQUENCE = [
+            { label: 'open', name: '1. Open Hand', detail: '손과 엄지를 모두 쫙 펴고 유지 (v3)', duration: 5.0 },
+            { label: 'thumb_abduct', name: '2. Thumb Spread Out', detail: '엄지만 손바닥 바깥쪽으로 최대한 벌리고 유지', duration: 5.0 },
+            { label: 'thumb_adduct', name: '3. Thumb Toward Index', detail: '엄지만 검지 쪽으로 붙이고 유지', duration: 5.0 },
+            { label: 'thumb_flex', name: '4. Thumb Fold In', detail: '엄지만 손바닥 안쪽으로 깊게 접고 유지', duration: 5.0 },
+            { label: 'fist', name: '5. Fist', detail: '모든 손가락을 주먹처럼 쥐고 유지', duration: 5.0 },
+            { label: 'open_repeat', name: '6. Open Again', detail: '다시 손과 엄지를 모두 쫙 펴고 유지', duration: 5.0 },
+        ];
+        const POSE_TOTAL = POSE_SEQUENCE.reduce((sum, item) => sum + item.duration, 0);
+
+        function currentPoseGuide(timestamp) {
+            const t = (timestamp / 1000.0) % POSE_TOTAL;
+            let acc = 0.0;
+            for (let i = 0; i < POSE_SEQUENCE.length; i++) {
+                const pose = POSE_SEQUENCE[i];
+                if (t < acc + pose.duration) {
+                    return { ...pose, index: i, elapsed: t - acc, remaining: acc + pose.duration - t };
+                }
+                acc += pose.duration;
+            }
+            const fallback = POSE_SEQUENCE[POSE_SEQUENCE.length - 1];
+            return { ...fallback, index: POSE_SEQUENCE.length - 1, elapsed: fallback.duration, remaining: 0.0 };
+        }
+
+        function makeTextTexture(title, detail, timer) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 1024;
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.72)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.font = 'bold 58px system-ui, sans-serif';
+            ctx.fillText(title, canvas.width / 2, 72);
+            ctx.font = '34px system-ui, sans-serif';
+            ctx.fillText(detail, canvas.width / 2, 146);
+            ctx.font = 'bold 44px system-ui, sans-serif';
+            ctx.fillText(timer, canvas.width / 2, 210);
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.needsUpdate = true;
+            return texture;
+        }
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 10);
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true }); 
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.xr.enabled = true; 
+        document.body.appendChild(renderer.domElement);
+
+        scene.add(new THREE.HemisphereLight(0xbcbcbc, 0x222222, 1.5));
+        const light = new THREE.DirectionalLight(0xffffff, 1.5);
+        light.position.set(0, 6, 0);
+        scene.add(light);
+
+        document.body.appendChild(ARButton.createButton(renderer, {
+            requiredFeatures: ['hand-tracking'],
+            optionalFeatures: ['dom-overlay'],
+            domOverlay: { root: document.body }
+        }));
+
+        const handModelFactory = new XRHandModelFactory();
+        const hand1 = renderer.xr.getHand(0);
+        hand1.add(handModelFactory.createHandModel(hand1, "mesh")); 
+        scene.add(hand1);
+
+        const hand2 = renderer.xr.getHand(1);
+        hand2.add(handModelFactory.createHandModel(hand2, "mesh"));
+        scene.add(hand2);
+
+        let lastGuideText = '';
+        const guideTexture = makeTextTexture('Prepare', 'Follow each hand pose and hold it steady.', '0.0s');
+        const guideMaterial = new THREE.MeshBasicMaterial({ map: guideTexture, transparent: true, depthTest: false });
+        const guideMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.25, 0.31), guideMaterial);
+        guideMesh.position.set(0, 0.35, -1.25);
+        guideMesh.renderOrder = 999;
+        camera.add(guideMesh);
+        scene.add(camera);
+
+        const WEBXR_HAND_JOINTS = [
+            'wrist',
+            'thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip',
+            'index-finger-metacarpal', 'index-finger-phalanx-proximal', 'index-finger-phalanx-intermediate', 'index-finger-phalanx-distal', 'index-finger-tip',
+            'middle-finger-metacarpal', 'middle-finger-phalanx-proximal', 'middle-finger-phalanx-intermediate', 'middle-finger-phalanx-distal', 'middle-finger-tip',
+            'ring-finger-metacarpal', 'ring-finger-phalanx-proximal', 'ring-finger-phalanx-intermediate', 'ring-finger-phalanx-distal', 'ring-finger-tip',
+            'pinky-finger-metacarpal', 'pinky-finger-phalanx-proximal', 'pinky-finger-phalanx-intermediate', 'pinky-finger-phalanx-distal', 'pinky-finger-tip'
+        ];
+
+        // ⏱️ 클러치 오작동 방지(Debounce)를 위한 타이머 세팅
+        const pinchStart = { left: 0, right: 0 };
+        const clutchState = { left: false, right: false };
+        const PINCH_THRESHOLD_MS = 150; // 0.15초 유지해야 켜짐
+
+        // 🚀 매 프레임 실행 루프
+        renderer.setAnimationLoop((timestamp, frame) => {
+            const poseGuide = currentPoseGuide(timestamp);
+            const timerText = `${Math.max(0, poseGuide.remaining).toFixed(1)}s`;
+            poseNameEl.textContent = poseGuide.name;
+            poseDetailEl.textContent = poseGuide.detail;
+            poseTimerEl.textContent = timerText;
+            const guideText = `${poseGuide.name}|${poseGuide.detail}|${timerText}`;
+            if (guideText !== lastGuideText) {
+                const nextTexture = makeTextTexture(poseGuide.name, poseGuide.detail, timerText);
+                guideMaterial.map.dispose();
+                guideMaterial.map = nextTexture;
+                guideMaterial.needsUpdate = true;
+                lastGuideText = guideText;
+            }
+
+            if (frame && socket.readyState === WebSocket.OPEN) {
+                const referenceSpace = renderer.xr.getReferenceSpace();
+                let shared_xr_data = {
+                    head: null,
+                    left: null,
+                    right: null,
+                    pose_label: poseGuide.label,
+                    pose_name: poseGuide.name,
+                    pose_elapsed: poseGuide.elapsed,
+                    pose_remaining: poseGuide.remaining
+                };
+
+                // 🌟 1. 헤드셋(목에 건 VR 기기) 6D Pose 추출
+                const viewerPose = frame.getViewerPose(referenceSpace);
+                if (viewerPose) {
+                    shared_xr_data.head = {
+                        pos: {
+                            x: viewerPose.transform.position.x,
+                            y: viewerPose.transform.position.y,
+                            z: viewerPose.transform.position.z
+                        },
+                        rot: {
+                            x: viewerPose.transform.orientation.x,
+                            y: viewerPose.transform.orientation.y,
+                            z: viewerPose.transform.orientation.z,
+                            w: viewerPose.transform.orientation.w
+                        }
+                    };
+                }
+
+                // 🖐️ 2. 양손 좌표 및 '안전한' 클러치 추출
+                for (const inputSource of frame.session.inputSources) {
+                    if (inputSource.hand) {
+                        const hand = inputSource.hand;
+                        const handedness = inputSource.handedness; 
+                        const wristJoint = hand.get('wrist');
+                        const wristPose = frame.getJointPose(wristJoint, referenceSpace);
+
+                        const thumbTip = frame.getJointPose(hand.get('thumb-tip'), referenceSpace);
+                        const indexTip = frame.getJointPose(hand.get('index-finger-tip'), referenceSpace);
+
+                        // 🔥 시간 지연(Time Threshold)이 적용된 클러치 로직
+                        if (thumbTip && indexTip) {
+                            const dx = thumbTip.transform.position.x - indexTip.transform.position.x;
+                            const dy = thumbTip.transform.position.y - indexTip.transform.position.y;
+                            const dz = thumbTip.transform.position.z - indexTip.transform.position.z;
+                            const distance = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+                            if (distance < 0.025) { // 2.5cm 이내
+                                if (pinchStart[handedness] === 0) {
+                                    pinchStart[handedness] = timestamp; 
+                                } else if (timestamp - pinchStart[handedness] > PINCH_THRESHOLD_MS) {
+                                    clutchState[handedness] = true; // 150ms 유지 시 찐 클러치 인정!
+                                }
+                            } else {
+                                // 스치거나 떨어지면 즉각 해제
+                                pinchStart[handedness] = 0;
+                                clutchState[handedness] = false;
+                            }
+                        }
+
+                        const joints = [
+                            'thumb-tip', 'index-finger-tip', 'middle-finger-tip', 'ring-finger-tip', 'pinky-finger-tip'
+                        ];
+                        const fingerDistances = {};
+                        const handJoints = {};
+
+                        if (wristPose) {
+                            WEBXR_HAND_JOINTS.forEach(jname => {
+                                const joint = hand.get(jname);
+                                if (!joint) return;
+
+                                const jointPose = frame.getJointPose(joint, referenceSpace);
+                                if (!jointPose) return;
+
+                                handJoints[jname] = {
+                                    pos: {
+                                        x: jointPose.transform.position.x,
+                                        y: jointPose.transform.position.y,
+                                        z: jointPose.transform.position.z
+                                    },
+                                    rot: {
+                                        x: jointPose.transform.orientation.x,
+                                        y: jointPose.transform.orientation.y,
+                                        z: jointPose.transform.orientation.z,
+                                        w: jointPose.transform.orientation.w
+                                    },
+                                    radius: jointPose.radius || 0
+                                };
+                            });
+
+                            joints.forEach(jname => {
+                                const tipPose = frame.getJointPose(hand.get(jname), referenceSpace);
+                                if (tipPose) {
+                                    const dx = tipPose.transform.position.x - wristPose.transform.position.x;
+                                    const dy = tipPose.transform.position.y - wristPose.transform.position.y;
+                                    const dz = tipPose.transform.position.z - wristPose.transform.position.z;
+                                    fingerDistances[jname] = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                                }
+                            });
+
+                            shared_xr_data[handedness] = {
+                                pos: { x: wristPose.transform.position.x, y: wristPose.transform.position.y, z: wristPose.transform.position.z },
+                                rot: { x: wristPose.transform.orientation.x, y: wristPose.transform.orientation.y, z: wristPose.transform.orientation.z, w: wristPose.transform.orientation.w },
+                                clutch: clutchState[handedness],
+                                fingers: fingerDistances,
+                                joints: handJoints
+                            };
+                        }
+                    }
+                }
+
+                if (shared_xr_data.head || shared_xr_data.left || shared_xr_data.right) {
+                    socket.send(JSON.stringify(shared_xr_data));
+                }
+            }
+            renderer.render(scene, camera);
+        });
+    </script>
+</body>
+</html>

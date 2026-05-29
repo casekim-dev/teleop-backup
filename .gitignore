@@ -1,0 +1,22 @@
+# Build and generated outputs
+build/
+install/
+log/
+__pycache__/
+*.pyc
+
+# Local SDK/vendor clones kept outside backup scope
+igris_c_sdk_public/
+igris_sdk_robot/
+televuer/
+
+# Local TLS/private key material
+*.pem
+key.pem
+cert.pem
+server.pem
+
+# Runtime/editor noise
+.DS_Store
+*.swp
+*.tmp
