@@ -104,6 +104,14 @@ class FingerFootPoseNode(Node):
         self.rot_zero = {"left": None, "right": None}
         self.robot_zero = {"left": None, "right": None}
         self.prev_state = {"left": None, "right": None}
+        self.last_arm_cmd = {
+            "left": {"linear": (0.0, 0.0, 0.0), "angular": (0.0, 0.0, 0.0), "clutch": False, "mode": "init"},
+            "right": {"linear": (0.0, 0.0, 0.0), "angular": (0.0, 0.0, 0.0), "clutch": False, "mode": "init"},
+        }
+
+        self.base_frame = str(self.declare_parameter("base_frame", "base_link").value)
+        self.left_ee_frame = str(self.declare_parameter("left_ee_frame", "Left_Hand").value)
+        self.right_ee_frame = str(self.declare_parameter("right_ee_frame", "Right_Hand").value)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -170,6 +178,16 @@ class FingerFootPoseNode(Node):
         self.finger_open_deg = float(self.declare_parameter("finger_open_deg", 172.0).value)
         self.finger_closed_deg = float(self.declare_parameter("finger_closed_deg", 105.0).value)
 
+        self.wrist_to_ee_roll = float(self.declare_parameter("wrist_to_ee_roll", 0.0).value)
+        self.wrist_to_ee_pitch = float(self.declare_parameter("wrist_to_ee_pitch", 0.0).value)
+        self.wrist_to_ee_yaw = float(self.declare_parameter("wrist_to_ee_yaw", 0.0).value)
+        self.wrist_to_ee_order = str(self.declare_parameter("wrist_to_ee_order", "post").value)
+        self.wrist_to_ee_offset = self.quat_from_rpy(
+            self.wrist_to_ee_roll,
+            self.wrist_to_ee_pitch,
+            self.wrist_to_ee_yaw,
+        )
+
         self.joint_names = [
             "Fing_all_R",
             "joint_2",
@@ -189,7 +207,7 @@ class FingerFootPoseNode(Node):
         self.prev_waist_state = None
 
         self.timer = self.create_timer(self.dt, self.timer_callback)
-        self.debug_timer = self.create_timer(1.0, self.debug_callback)
+        self.debug_timer = self.create_timer(0.1, self.debug_callback)
         self.get_logger().info("Finger foot pose node started")
         self.get_logger().info("WebSocket input: 0.0.0.0:8765")
         self.get_logger().info("Hand bridge: /igris/hand/joint_states -> /igris_c/hand/targets")
@@ -254,52 +272,150 @@ class FingerFootPoseNode(Node):
         yaw = math.atan2(t3, t4)
         return roll, pitch, yaw
 
-    def map_vr_to_ros_quat(self, rot):
-        return {"x": -rot["z"], "y": -rot["x"], "z": rot["y"], "w": rot["w"]}
+    def quat_to_matrix(self, q):
+        q = self.normalize_quat(q)
+        x, y, z, w = q["x"], q["y"], q["z"], q["w"]
+        return [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ]
 
-    def publish_zero_twist(self, twist_pub):
+    def matrix_to_quat(self, m):
+        trace = m[0][0] + m[1][1] + m[2][2]
+        if trace > 0.0:
+            s = math.sqrt(trace + 1.0) * 2.0
+            return self.normalize_quat({
+                "w": 0.25 * s,
+                "x": (m[2][1] - m[1][2]) / s,
+                "y": (m[0][2] - m[2][0]) / s,
+                "z": (m[1][0] - m[0][1]) / s,
+            })
+        if m[0][0] > m[1][1] and m[0][0] > m[2][2]:
+            s = math.sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0
+            return self.normalize_quat({
+                "w": (m[2][1] - m[1][2]) / s,
+                "x": 0.25 * s,
+                "y": (m[0][1] + m[1][0]) / s,
+                "z": (m[0][2] + m[2][0]) / s,
+            })
+        if m[1][1] > m[2][2]:
+            s = math.sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0
+            return self.normalize_quat({
+                "w": (m[0][2] - m[2][0]) / s,
+                "x": (m[0][1] + m[1][0]) / s,
+                "y": 0.25 * s,
+                "z": (m[1][2] + m[2][1]) / s,
+            })
+        s = math.sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0
+        return self.normalize_quat({
+            "w": (m[1][0] - m[0][1]) / s,
+            "x": (m[0][2] + m[2][0]) / s,
+            "y": (m[1][2] + m[2][1]) / s,
+            "z": 0.25 * s,
+        })
+
+    def matmul3(self, a, b):
+        return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+    def mattranspose3(self, m):
+        return [[m[j][i] for j in range(3)] for i in range(3)]
+
+    def quat_from_rpy(self, roll, pitch, yaw):
+        cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+        cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+        cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+        return self.normalize_quat({
+            "x": sr * cp * cy - cr * sp * sy,
+            "y": cr * sp * cy + sr * cp * sy,
+            "z": cr * cp * sy - sr * sp * cy,
+            "w": cr * cp * cy + sr * sp * sy,
+        })
+
+    def map_vr_to_ros_quat(self, rot):
+        basis = [
+            [0.0, 0.0, -1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]
+        r_vr = self.quat_to_matrix(rot)
+        r_ros = self.matmul3(self.matmul3(basis, r_vr), self.mattranspose3(basis))
+        return self.matrix_to_quat(r_ros)
+
+    def apply_wrist_to_ee_offset(self, q_ros_wrist):
+        if self.wrist_to_ee_order == "pre":
+            return self.normalize_quat(self.quat_multiply(self.wrist_to_ee_offset, q_ros_wrist))
+        return self.normalize_quat(self.quat_multiply(q_ros_wrist, self.wrist_to_ee_offset))
+
+    def publish_zero_twist(self, twist_pub, side=None, mode="zero"):
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "base_link"
+        msg.header.frame_id = self.base_frame
         twist_pub.publish(msg)
+        if side is not None:
+            self.last_arm_cmd[side] = {
+                "linear": (0.0, 0.0, 0.0),
+                "angular": (0.0, 0.0, 0.0),
+                "clutch": shared_foot_clutch[side],
+                "mode": mode,
+            }
 
     def calc_angular_velocity(self, q1, q2, dt):
+        q1 = self.normalize_quat(q1)
+        q2 = self.normalize_quat(q2)
         dot = q1["x"] * q2["x"] + q1["y"] * q2["y"] + q1["z"] * q2["z"] + q1["w"] * q2["w"]
-        sign = 1.0 if dot >= 0 else -1.0
-        qdx = (q2["x"] * sign - q1["x"]) / dt
-        qdy = (q2["y"] * sign - q1["y"]) / dt
-        qdz = (q2["z"] * sign - q1["z"]) / dt
-        qdw = (q2["w"] * sign - q1["w"]) / dt
-        wx = 2.0 * (qdx * q1["w"] - qdw * q1["x"] - qdy * q1["z"] + qdz * q1["y"])
-        wy = 2.0 * (qdy * q1["w"] - qdw * q1["y"] + qdx * q1["z"] - qdz * q1["x"])
-        wz = 2.0 * (qdz * q1["w"] - qdw * q1["z"] - qdx * q1["y"] + qdy * q1["x"])
-        return wx, wy, wz
+        if dot < 0.0:
+            q2 = {k: -q2[k] for k in ("x", "y", "z", "w")}
+
+        # base_link/world-frame angular delta: R_delta = R_curr * R_prev^T.
+        q_delta = self.normalize_quat(self.quat_multiply(q2, self.quat_inverse(q1)))
+        v_norm = math.sqrt(q_delta["x"] ** 2 + q_delta["y"] ** 2 + q_delta["z"] ** 2)
+        if v_norm < 1e-9 or dt <= 0.0:
+            return 0.0, 0.0, 0.0
+
+        angle = 2.0 * math.atan2(v_norm, q_delta["w"])
+        if angle > math.pi:
+            angle -= 2.0 * math.pi
+        elif angle < -math.pi:
+            angle += 2.0 * math.pi
+
+        scale = angle / (v_norm * dt)
+        return q_delta["x"] * scale, q_delta["y"] * scale, q_delta["z"] * scale
 
     def process_arm(self, side, xr_data, twist_pub):
         global shared_foot_clutch
 
         curr_clutch = shared_foot_clutch[side]
         vr_pos = self.map_vr_to_ros(xr_data["pos"])
-        vr_rot = xr_data["rot"]
-        ee_frame = "Left_Hand" if side == "left" else "Right_Hand"
+        vr_rot = self.apply_wrist_to_ee_offset(self.map_vr_to_ros_quat(xr_data["rot"]))
+        ee_frame = self.left_ee_frame if side == "left" else self.right_ee_frame
 
         if curr_clutch and not self.prev_clutch[side]:
             try:
-                trans = self.tf_buffer.lookup_transform("base_link", ee_frame, rclpy.time.Time())
+                trans = self.tf_buffer.lookup_transform(self.base_frame, ee_frame, rclpy.time.Time())
                 self.robot_zero[side] = trans.transform.translation
                 self.human_zero[side] = vr_pos
                 self.rot_zero[side] = vr_rot
                 self.prev_state[side] = {"rot": vr_rot}
-                self.publish_zero_twist(twist_pub)
+                self.publish_zero_twist(twist_pub, side, "clutch_on_zero")
             except Exception as e:
-                self.get_logger().warn(f"TF lookup failed for {ee_frame}: {e}")
-                curr_clutch = False
+                self.get_logger().warn(
+                    f"TF lookup failed for {self.base_frame}->{ee_frame}: {e}",
+                    throttle_duration_sec=1.0,
+                )
+                self.last_arm_cmd[side]["mode"] = "tf_missing"
+                self.last_arm_cmd[side]["clutch"] = curr_clutch
+                self.prev_clutch[side] = True
+                return
             self.prev_clutch[side] = curr_clutch
             return
 
         if not curr_clutch:
             if self.prev_clutch[side]:
-                self.publish_zero_twist(twist_pub)
+                self.publish_zero_twist(twist_pub, side, "clutch_off_zero")
+            else:
+                self.last_arm_cmd[side]["clutch"] = False
+                self.last_arm_cmd[side]["mode"] = "clutch_off"
             self.prev_clutch[side] = curr_clutch
             return
 
@@ -308,7 +424,7 @@ class FingerFootPoseNode(Node):
             return
 
         try:
-            curr_trans = self.tf_buffer.lookup_transform("base_link", ee_frame, rclpy.time.Time())
+            curr_trans = self.tf_buffer.lookup_transform(self.base_frame, ee_frame, rclpy.time.Time())
             curr_pos = curr_trans.transform.translation
 
             target_x = self.robot_zero[side].x + (vr_pos["x"] - self.human_zero[side]["x"])
@@ -318,7 +434,7 @@ class FingerFootPoseNode(Node):
             p_gain = 4.0
             msg = TwistStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = "base_link"
+            msg.header.frame_id = self.base_frame
             msg.twist.linear.x = (target_x - curr_pos.x) * p_gain
             msg.twist.linear.y = (target_y - curr_pos.y) * p_gain
             msg.twist.linear.z = (target_z - curr_pos.z) * p_gain
@@ -326,11 +442,17 @@ class FingerFootPoseNode(Node):
             prev_rot = self.prev_state[side]["rot"]
             wx, wy, wz = self.calc_angular_velocity(prev_rot, vr_rot, self.dt)
             a_gain = 2.0
-            msg.twist.angular.x = float(-wz * a_gain)
-            msg.twist.angular.y = float(-wx * a_gain)
-            msg.twist.angular.z = float(wy * a_gain)
+            msg.twist.angular.x = float(wx * a_gain)
+            msg.twist.angular.y = float(wy * a_gain)
+            msg.twist.angular.z = float(wz * a_gain)
 
             twist_pub.publish(msg)
+            self.last_arm_cmd[side] = {
+                "linear": (msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z),
+                "angular": (msg.twist.angular.x, msg.twist.angular.y, msg.twist.angular.z),
+                "clutch": curr_clutch,
+                "mode": "active",
+            }
             self.prev_state[side]["rot"] = vr_rot
         except Exception:
             pass
@@ -683,48 +805,42 @@ class FingerFootPoseNode(Node):
         if shared_xr_data["left"]:
             self.process_arm("left", shared_xr_data["left"], self.left_pub)
             self.process_fingers("left", shared_xr_data["left"], self.left_hand_pub)
+        else:
+            self.last_arm_cmd["left"]["mode"] = "no_xr"
+            self.last_arm_cmd["left"]["clutch"] = shared_foot_clutch["left"]
+
         if shared_xr_data["right"]:
             self.process_arm("right", shared_xr_data["right"], self.right_pub)
             self.process_fingers("right", shared_xr_data["right"], self.right_hand_pub)
+        else:
+            self.last_arm_cmd["right"]["mode"] = "no_xr"
+            self.last_arm_cmd["right"]["clutch"] = shared_foot_clutch["right"]
+
+    def dominant_rotation_label(self, values, threshold=0.2):
+        names = ("rot_about_base_x", "rot_about_base_y", "rot_about_base_z")
+        idx = max(range(3), key=lambda i: abs(values[i]))
+        value = values[idx]
+        if abs(value) < threshold:
+            return "none"
+        return f"{names[idx]}{'+' if value >= 0.0 else '-'}({value:.4f})"
 
     def debug_callback(self):
-        left = shared_xr_data.get("left") or {}
-        right = shared_xr_data.get("right") or {}
-        with self.finger_lock:
-            values = (
-                self.fing_all_L,
-                self.fing_th_L,
-                self.fing_all_R,
-                self.fing_th_R,
-                bool(left),
-                bool(right),
-                bool(left.get("fingers")),
-                bool(right.get("fingers")),
-                bool(left.get("joints")),
-                bool(right.get("joints")),
-                self.target_publish_count,
-                [round(v, 3) for v in self.last_targets],
-                round(self.right_targets["thumb_up"], 3),
-                round(self.right_targets["thumb_down"], 3),
-                round(self.left_targets["thumb_up"], 3),
-                round(self.left_targets["thumb_down"], 3),
-                self.last_thumb_features["right"].get("bend_angle"),
-                self.last_thumb_features["right"].get("spread_angle"),
-                self.last_thumb_features["left"].get("bend_angle"),
-                self.last_thumb_features["left"].get("spread_angle"),
-                self.last_thumb_features["right"].get("spread_raw"),
-                self.last_thumb_features["left"].get("spread_raw"),
-                self.last_retarget_mode["left"],
-                self.last_retarget_mode["right"],
-            )
-
+        l_ang = self.last_arm_cmd["left"]["angular"]
+        r_ang = self.last_arm_cmd["right"]["angular"]
+        left_ang = [round(v, 4) for v in l_ang]
+        right_ang = [round(v, 4) for v in r_ang]
         self.get_logger().info(
-            "hand targets L(all/th)=%.3f/%.3f R(all/th)=%.3f/%.3f "
-            "xr_seen L=%s R=%s ws_fingers L=%s R=%s ws_joints L=%s R=%s "
-            "pub_count=%d last_targets=%s thumb R(bend/spread)=%.3f/%.3f "
-            "L(bend/spread)=%.3f/%.3f features R(bend/spread_angle)=%s/%s "
-            "L(bend/spread_angle)=%s/%s spread_raw R/L=%s/%s retarget L/R=%s/%s"
-            % values
+            "arm_orientation ang_base L=%s R=%s dom L/R=%s/%s mode L/R=%s/%s clutch L/R=%s/%s"
+            % (
+                left_ang,
+                right_ang,
+                self.dominant_rotation_label(l_ang),
+                self.dominant_rotation_label(r_ang),
+                self.last_arm_cmd["left"]["mode"],
+                self.last_arm_cmd["right"]["mode"],
+                self.last_arm_cmd["left"]["clutch"],
+                self.last_arm_cmd["right"]["clutch"],
+            )
         )
 
 
