@@ -241,37 +241,63 @@ linear = (target_robot_pos - current_robot_pos) * p_gain
 
 Current `p_gain` is `4.0`.
 
-### Body-Yaw Coupled Arm Target
+### Body-Relative Arm Target
 
-Current behavior is intended to be body-relative, not fixed world-relative.
+Current successful behavior is body-relative, not fixed world-relative.
 
-When the clutch is pressed, `finger1.py` stores:
+The WebXR page explicitly uses `local-floor` as the stable tracking/world frame:
 
-```text
-arm_zero_head_yaw[side] = latest_head_yaw
+```javascript
+renderer.xr.setReferenceSpaceType('local-floor');
 ```
 
-While the clutch is held, it computes:
+`finger1.py` then converts the local-floor/world hand delta into the user's current body-heading frame using the absolute current head yaw:
 
 ```python
-body_yaw_delta = -(latest_head_yaw - arm_zero_head_yaw[side])
+body_yaw_delta = -latest_head_yaw
 ```
 
-The arm position target is then rotated in the base XY plane by `body_yaw_delta` before P-control. This means:
+On clutch rising edge, the node stores:
 
 ```text
-hand already extended forward + user/waist turns 90 deg
-  -> robot arm target should rotate with the body/waist instead of staying at the old world direction
+robot_zero[side] = current robot EE position in base_frame
+human_zero[side] = current mapped WebXR wrist position
 ```
 
-Switches:
+While clutch is held:
+
+```python
+dx = current_hand_x - human_zero_x
+dy = current_hand_y - human_zero_y
+dz = current_hand_z - human_zero_z
+
+dx_cmd, dy_cmd = rotate_xy(dx, dy, -latest_head_yaw)
+
+target_x = robot_zero.x + dx_cmd
+target_y = robot_zero.y + dy_cmd
+target_z = robot_zero.z + dz
+```
+
+Important: only the hand movement delta is yaw-normalized. `robot_zero` itself is not rotated by default. This is what made the axes consistent after turning 90 degrees and re-clutching.
+
+Current successful parameter combination:
 
 ```text
-rotate_arm_with_head_yaw          default True
-rotate_orientation_with_head_yaw  default True
+arm_delta_yaw_mode              default absolute_head
+rotate_arm_with_head_yaw         default True
+rotate_arm_zero_with_head_yaw    default False
+rotate_orientation_with_head_yaw default True
 ```
 
-If the arm follows the body yaw in the wrong direction, first try flipping the sign of `body_yaw_delta` in `process_arm()`.
+Other modes are retained only for debugging/regression tests:
+
+```text
+absolute_head  current correct mode; rotate hand delta by -latest_head_yaw
+clutch_delta   older mode; rotate by yaw change since clutch-on
+none           no yaw compensation
+```
+
+If the body-relative axes are consistent but sign-reversed, first test flipping the sign of `body_yaw_delta` in `process_arm()`.
 
 ## Arm Orientation Details
 
@@ -285,14 +311,14 @@ q_vr_wrist
   -> q_robot_target
 ```
 
-When `rotate_orientation_with_head_yaw` is enabled, the same body yaw delta used for arm position is also applied to orientation before angular velocity is computed:
+When `rotate_orientation_with_head_yaw` is enabled, the same `body_yaw_delta` used for arm delta normalization is also applied to orientation before angular velocity is computed:
 
 ```python
 q_body_yaw = quat_from_rpy(0.0, 0.0, body_yaw_delta)
 target_rot = q_body_yaw * q_robot_target
 ```
 
-This is the current intended behavior: wrist/EE orientation should rotate with the user's body/waist heading, not remain locked to the old world heading. Fine tuning is still expected around wrist-to-EE offset and sign conventions.
+With the current successful setup, `body_yaw_delta = -latest_head_yaw`. This keeps wrist/EE orientation body-relative in the same way as translation. Fine tuning is still expected around wrist-to-EE offset and sign conventions.
 
 Angular velocity is computed in base/world frame:
 
@@ -482,9 +508,11 @@ TELEOP_BACKUP_NOTES.md
 Latest tested direction:
 
 - Quest/WebXR connection recovered and `finger1.py` can receive wrist/head/hand data over WebSocket `8765`.
-- Arm translation now follows the user's current body/head yaw: if the user turns and then reaches forward, the robot reaches forward relative to the turned body.
-- Additional fix added after testing: if the user is already reaching forward and then rotates the body/waist, the arm target is rotated with the body yaw instead of remaining at the old world direction.
-- Orientation now applies the same body yaw delta before angular velocity calculation. This is directionally correct but still needs fine tuning.
+- WebXR reference space is explicitly `local-floor`.
+- Arm translation now uses `arm_delta_yaw_mode=absolute_head`: local-floor/world hand delta is rotated by `-latest_head_yaw` before being added to `robot_zero`.
+- This fixed the observed issue where the same body-relative arm motion produced robot axes rotated by 90 degrees after the operator turned 90 degrees.
+- `robot_zero` is not rotated by default; only hand delta is yaw-normalized. Keep `rotate_arm_zero_with_head_yaw=False` unless deliberately testing the older behavior.
+- Orientation applies the same body yaw delta before angular velocity calculation. This is directionally correct but still needs fine tuning.
 - Remaining tuning knobs are mainly `body_yaw_delta` sign, `wrist_to_ee_roll/pitch/yaw`, `wrist_to_ee_order`, and angular gain `a_gain`.
 
 Important runtime reminder:
@@ -502,3 +530,40 @@ Quick validation sequence for the next session:
 5. Press clutch and test arm translation with head/body yaw at 0 deg and 90 deg.
 6. Test holding the arm extended while rotating the body/waist; arm target should rotate with the body.
 7. Test wrist orientation after body yaw; expect correct qualitative direction, but tune offsets/gains if axes feel rotated or scaled.
+
+## 2026-06-01 Update: Correct Body-Relative Axis Fix
+
+The correct fix for consistent operator-body-relative axes is now confirmed.
+
+Problem observed:
+
+```text
+Facing forward: arm forward/side/up mapped one way.
+Operator turned 90 deg: same body-relative arm motion produced axes rotated by 90 deg.
+```
+
+Root cause:
+
+- WebXR wrist positions are in `local-floor`/world coordinates.
+- The previous `clutch_delta` yaw compensation becomes zero when the operator turns first and then re-clutches.
+- Therefore world-frame hand deltas leaked directly into robot commands.
+
+Correct behavior:
+
+```python
+body_yaw_delta = -latest_head_yaw
+dx_cmd, dy_cmd = rotate_xy(dx, dy, body_yaw_delta)
+target = robot_zero + [dx_cmd, dy_cmd, dz]
+```
+
+Do not rotate `robot_zero` by default. The successful setting is:
+
+```text
+WebXR reference space            local-floor
+arm_delta_yaw_mode               absolute_head
+rotate_arm_with_head_yaw          True
+rotate_arm_zero_with_head_yaw     False
+rotate_orientation_with_head_yaw  True
+```
+
+This makes the same operator-body-relative hand movement produce the same robot command axes regardless of whether the operator is facing 0 deg or 90 deg.

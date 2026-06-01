@@ -209,33 +209,53 @@ Excluded from git backup:
 - SDK/vendor clones under `igris_c_sdk_public/`, `igris_sdk_robot/`, `televuer/`
 - local TLS/key files such as `*.pem`
 
-## 2026-05-29 Update: Body-Relative Arm and Orientation
+## 2026-06-01 Update: Confirmed Body-Relative Arm Axis Fix
 
-Today the remaining body-relative behavior was addressed in `finger1.py`.
+The correct body-relative behavior is now confirmed in `finger1.py`.
 
-Observed issue:
+Observed issue before the fix:
 
-- Reaching forward after turning the head/body worked.
-- But if the hand was already extended forward and the user rotated from yaw 0 deg to yaw 90 deg, the robot arm target stayed near the old world direction instead of rotating with the body.
+- When facing forward, arm axes looked one way.
+- After turning the operator body/head 90 degrees and re-clutching, the same body-relative arm movement produced robot axes rotated by 90 degrees.
 
-Implemented behavior:
+Root cause:
 
-- On clutch rising edge, the node stores `arm_zero_head_yaw[side]`.
-- While clutch is held, it computes `body_yaw_delta = -(latest_head_yaw - arm_zero_head_yaw[side])`.
-- Arm XY target is rotated by this body yaw delta before P-control.
-- Orientation target is also pre-multiplied by `q_body_yaw` before angular velocity calculation.
+- WebXR wrist pose is read in the `local-floor` tracking/world frame.
+- The previous `clutch_delta` compensation only used yaw change after clutch-on.
+- If the operator turned first and then clutched, yaw change after clutch-on was zero, so world-frame hand deltas were sent directly.
 
-New/important parameters:
+Confirmed fix:
 
+- Keep WebXR reference space as `local-floor` in `index.html`.
+- Use `arm_delta_yaw_mode = absolute_head` in `finger1.py`.
+- Convert every hand delta from local-floor/world heading into the current operator body-heading frame using absolute head yaw:
+
+```python
+body_yaw_delta = -latest_head_yaw
+dx_cmd, dy_cmd = rotate_xy(dx, dy, body_yaw_delta)
+target_x = robot_zero.x + dx_cmd
+target_y = robot_zero.y + dy_cmd
+target_z = robot_zero.z + dz
+```
+
+Important implementation detail:
+
+- Do not rotate `robot_zero` by default.
+- Only rotate the hand movement delta.
+- Keep `rotate_arm_zero_with_head_yaw = False` unless intentionally testing old behavior.
+
+Current successful parameters:
+
+- `arm_delta_yaw_mode = absolute_head`
 - `rotate_arm_with_head_yaw = True`
+- `rotate_arm_zero_with_head_yaw = False`
 - `rotate_orientation_with_head_yaw = True`
-- `wrist_to_ee_roll/pitch/yaw` and `wrist_to_ee_order` remain the main orientation tuning knobs.
+- `rotate_orientation_with_head_yaw` applies the same yaw normalization to wrist/EE target orientation before angular velocity calculation.
 
-Current status:
+Remaining tuning:
 
-- Directional behavior appears correct.
-- Fine tuning is still needed for orientation feel and possibly sign/gain.
-- If body yaw coupling is reversed, flip the sign of `body_yaw_delta` in `process_arm()`.
+- If axes are consistent but signs are reversed, test flipping `body_yaw_delta` sign.
+- Orientation may still need `wrist_to_ee_roll/pitch/yaw`, `wrist_to_ee_order`, and `a_gain` tuning.
 
 Next-session checks:
 
