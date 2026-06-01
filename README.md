@@ -241,6 +241,38 @@ linear = (target_robot_pos - current_robot_pos) * p_gain
 
 Current `p_gain` is `4.0`.
 
+### Body-Yaw Coupled Arm Target
+
+Current behavior is intended to be body-relative, not fixed world-relative.
+
+When the clutch is pressed, `finger1.py` stores:
+
+```text
+arm_zero_head_yaw[side] = latest_head_yaw
+```
+
+While the clutch is held, it computes:
+
+```python
+body_yaw_delta = -(latest_head_yaw - arm_zero_head_yaw[side])
+```
+
+The arm position target is then rotated in the base XY plane by `body_yaw_delta` before P-control. This means:
+
+```text
+hand already extended forward + user/waist turns 90 deg
+  -> robot arm target should rotate with the body/waist instead of staying at the old world direction
+```
+
+Switches:
+
+```text
+rotate_arm_with_head_yaw          default True
+rotate_orientation_with_head_yaw  default True
+```
+
+If the arm follows the body yaw in the wrong direction, first try flipping the sign of `body_yaw_delta` in `process_arm()`.
+
 ## Arm Orientation Details
 
 Current WebXR wrist quaternion path:
@@ -252,6 +284,15 @@ q_vr_wrist
   -> apply_wrist_to_ee_offset()
   -> q_robot_target
 ```
+
+When `rotate_orientation_with_head_yaw` is enabled, the same body yaw delta used for arm position is also applied to orientation before angular velocity is computed:
+
+```python
+q_body_yaw = quat_from_rpy(0.0, 0.0, body_yaw_delta)
+target_rot = q_body_yaw * q_robot_target
+```
+
+This is the current intended behavior: wrist/EE orientation should rotate with the user's body/waist heading, not remain locked to the old world heading. Fine tuning is still expected around wrist-to-EE offset and sign conventions.
 
 Angular velocity is computed in base/world frame:
 
@@ -401,6 +442,16 @@ const socket = new WebSocket('ws://192.168.50.3:8765');
 
 Check that `finger1.py` is running and listening on port 8765.
 
+Useful checks:
+
+```bash
+ps -ef | grep 'python3 finger1.py'
+ss -tanp | grep ':8765'
+ROS_DOMAIN_ID=94 ros2 node list | grep finger_footpose_node
+```
+
+If `ss` shows `ESTABLISHED` from the Quest IP, the WebSocket connection is alive. If debug logs show `ws_count` increasing and `xr L/R=True`, data is arriving.
+
 ### Hand moves but robot fingers do not
 
 Make sure the DDS hand bridge is running and subscribed to `/igris_c/hand/targets`.
@@ -425,3 +476,29 @@ Current important documentation files:
 README.md
 TELEOP_BACKUP_NOTES.md
 ```
+
+## 2026-05-29 Handoff Notes
+
+Latest tested direction:
+
+- Quest/WebXR connection recovered and `finger1.py` can receive wrist/head/hand data over WebSocket `8765`.
+- Arm translation now follows the user's current body/head yaw: if the user turns and then reaches forward, the robot reaches forward relative to the turned body.
+- Additional fix added after testing: if the user is already reaching forward and then rotates the body/waist, the arm target is rotated with the body yaw instead of remaining at the old world direction.
+- Orientation now applies the same body yaw delta before angular velocity calculation. This is directionally correct but still needs fine tuning.
+- Remaining tuning knobs are mainly `body_yaw_delta` sign, `wrist_to_ee_roll/pitch/yaw`, `wrist_to_ee_order`, and angular gain `a_gain`.
+
+Important runtime reminder:
+
+- Edits to `finger1.py` do not affect an already-running process. Restart `python3 finger1.py` after code changes.
+- Normal Quest page serving remains `python3 -m http.server 8012`; do not switch to the old HTTPS experiments unless explicitly needed.
+- For physical hand motion, `quest_handcmd_bridge` must also be running; otherwise `/igris_c/hand/targets` may have publisher but no subscriber.
+
+Quick validation sequence for the next session:
+
+1. Start/confirm robot TF and IK side.
+2. Serve the page: `python3 -m http.server 8012`.
+3. Run bridge: `python3 finger1.py`.
+4. Confirm WebSocket: `ss -tanp | grep ':8765'` should show Quest IP `ESTABLISHED`.
+5. Press clutch and test arm translation with head/body yaw at 0 deg and 90 deg.
+6. Test holding the arm extended while rotating the body/waist; arm target should rotate with the body.
+7. Test wrist orientation after body yaw; expect correct qualitative direction, but tune offsets/gains if axes feel rotated or scaled.

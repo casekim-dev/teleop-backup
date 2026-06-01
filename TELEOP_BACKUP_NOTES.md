@@ -208,3 +208,43 @@ Excluded from git backup:
 - `build/`, `install/`, `log/`
 - SDK/vendor clones under `igris_c_sdk_public/`, `igris_sdk_robot/`, `televuer/`
 - local TLS/key files such as `*.pem`
+
+## 2026-05-29 Update: Body-Relative Arm and Orientation
+
+Today the remaining body-relative behavior was addressed in `finger1.py`.
+
+Observed issue:
+
+- Reaching forward after turning the head/body worked.
+- But if the hand was already extended forward and the user rotated from yaw 0 deg to yaw 90 deg, the robot arm target stayed near the old world direction instead of rotating with the body.
+
+Implemented behavior:
+
+- On clutch rising edge, the node stores `arm_zero_head_yaw[side]`.
+- While clutch is held, it computes `body_yaw_delta = -(latest_head_yaw - arm_zero_head_yaw[side])`.
+- Arm XY target is rotated by this body yaw delta before P-control.
+- Orientation target is also pre-multiplied by `q_body_yaw` before angular velocity calculation.
+
+New/important parameters:
+
+- `rotate_arm_with_head_yaw = True`
+- `rotate_orientation_with_head_yaw = True`
+- `wrist_to_ee_roll/pitch/yaw` and `wrist_to_ee_order` remain the main orientation tuning knobs.
+
+Current status:
+
+- Directional behavior appears correct.
+- Fine tuning is still needed for orientation feel and possibly sign/gain.
+- If body yaw coupling is reversed, flip the sign of `body_yaw_delta` in `process_arm()`.
+
+Next-session checks:
+
+```bash
+python3 -m http.server 8012
+python3 finger1.py
+ss -tanp | grep ':8765'
+ROS_DOMAIN_ID=94 ros2 topic info /left_servo/left_servo/delta_twist_cmds -v
+ROS_DOMAIN_ID=94 ros2 topic info /right_servo/right_servo/delta_twist_cmds -v
+```
+
+For physical fingers, also run/check `quest_handcmd_bridge`; `/igris_c/hand/targets` needs a subscriber.

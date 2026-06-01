@@ -114,6 +114,12 @@ class FingerFootPoseNode(Node):
         self.rotate_orientation_with_head_yaw = bool(
             self.declare_parameter("rotate_orientation_with_head_yaw", True).value
         )
+        self.rotate_arm_zero_with_head_yaw = bool(
+            self.declare_parameter("rotate_arm_zero_with_head_yaw", False).value
+        )
+        self.arm_delta_yaw_mode = str(
+            self.declare_parameter("arm_delta_yaw_mode", "absolute_head").value
+        )
         self.last_arm_cmd = {
             "left": {"linear": (0.0, 0.0, 0.0), "angular": (0.0, 0.0, 0.0), "clutch": False, "mode": "init"},
             "right": {"linear": (0.0, 0.0, 0.0), "angular": (0.0, 0.0, 0.0), "clutch": False, "mode": "init"},
@@ -447,16 +453,27 @@ class FingerFootPoseNode(Node):
             dy = vr_pos["y"] - self.human_zero[side]["y"]
             dz = vr_pos["z"] - self.human_zero[side]["z"]
 
-            base_x = self.robot_zero[side].x + dx
-            base_y = self.robot_zero[side].y + dy
+            if self.arm_delta_yaw_mode == "clutch_delta":
+                body_yaw_delta = -(self.latest_head_yaw - self.arm_zero_head_yaw[side])
+            elif self.arm_delta_yaw_mode == "none":
+                body_yaw_delta = 0.0
+            else:
+                # Convert local-floor/world hand delta into the user's current body-heading frame.
+                # This keeps the same body-relative arm motion on the same robot axes even after
+                # the user turns 90 deg and re-clutches.
+                body_yaw_delta = -self.latest_head_yaw
+
+            if self.rotate_arm_with_head_yaw:
+                dx_cmd, dy_cmd = self.rotate_xy(dx, dy, body_yaw_delta)
+            else:
+                dx_cmd, dy_cmd = dx, dy
+
+            target_x = self.robot_zero[side].x + dx_cmd
+            target_y = self.robot_zero[side].y + dy_cmd
             target_z = self.robot_zero[side].z + dz
 
-            body_yaw_delta = -(self.latest_head_yaw - self.arm_zero_head_yaw[side])
-            if self.rotate_arm_with_head_yaw:
-                # Waist command is -head yaw, so rotate the arm target with the same commanded body yaw.
-                target_x, target_y = self.rotate_xy(base_x, base_y, body_yaw_delta)
-            else:
-                target_x, target_y = base_x, base_y
+            if self.rotate_arm_zero_with_head_yaw:
+                target_x, target_y = self.rotate_xy(target_x, target_y, body_yaw_delta)
 
             target_rot = vr_rot
             if self.rotate_orientation_with_head_yaw:
