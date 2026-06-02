@@ -29,6 +29,8 @@
         // 🚨 IP 주소 본인 PC에 맞게 꼭 확인!
         const socket = new WebSocket('ws://192.168.50.3:8765');
         socket.onopen = () => console.log("🟢 웹소켓 연결 성공!");
+        let xrTargetFrameRate = null;
+        let xrSupportedFrameRates = [];
 
         const scene = new THREE.Scene();
         const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 10);
@@ -49,6 +51,28 @@
             optionalFeatures: ['dom-overlay'],
             domOverlay: { root: document.body }
         }));
+
+        renderer.xr.addEventListener('sessionstart', async () => {
+            const session = renderer.xr.getSession();
+            if (!session) return;
+
+            if (session.supportedFrameRates && session.updateTargetFrameRate) {
+                const rates = Array.from(session.supportedFrameRates);
+                xrSupportedFrameRates = rates;
+                const targetRate = Math.max(...rates);
+                try {
+                    await session.updateTargetFrameRate(targetRate);
+                    xrTargetFrameRate = session.frameRate || targetRate;
+                    console.log(`XR target frame rate set to ${xrTargetFrameRate} Hz`);
+                } catch (err) {
+                    xrTargetFrameRate = session.frameRate || null;
+                    console.warn('XR target frame rate request failed:', err);
+                }
+            } else {
+                xrTargetFrameRate = session.frameRate || null;
+                console.log('XR target frame rate API not supported by this browser/session');
+            }
+        });
 
         const handModelFactory = new XRHandModelFactory();
         const hand1 = renderer.xr.getHand(0);
@@ -77,7 +101,13 @@
         renderer.setAnimationLoop((timestamp, frame) => {
             if (frame && socket.readyState === WebSocket.OPEN) {
                 const referenceSpace = renderer.xr.getReferenceSpace();
-                let shared_xr_data = { head: null, left: null, right: null };
+                let shared_xr_data = {
+                    head: null,
+                    left: null,
+                    right: null,
+                    xr_frame_rate: xrTargetFrameRate,
+                    xr_supported_frame_rates: xrSupportedFrameRates
+                };
 
                 // 🌟 1. 헤드셋(목에 건 VR 기기) 6D Pose 추출
                 const viewerPose = frame.getViewerPose(referenceSpace);

@@ -66,11 +66,8 @@ def foot_pedal_monitor(node_logger):
                         shared_foot_clutch["left"] = is_pressed
                         shared_foot_clutch["right"] = is_pressed
 
-                    if old_left != shared_foot_clutch["left"] or old_right != shared_foot_clutch["right"]:
-                        node_logger.info(
-                            f"Clutch State: L={shared_foot_clutch['left']}, "
-                            f"R={shared_foot_clutch['right']}"
-                        )
+                    # Keep clutch updates silent during normal operation; high-frequency terminal
+                    # output can slow down teleop. Re-enable with ad-hoc debugging if needed.
 
     except PermissionError:
         node_logger.error("Permission denied. Run with sudo to read the foot pedal.")
@@ -101,7 +98,11 @@ def start_ws_server():
 class FingerFootPoseNode(Node):
     def __init__(self):
         super().__init__("finger_footpose_node")
-        self.dt = 0.02
+        self.control_rate_hz = float(self.declare_parameter("control_rate_hz", 100.0).value)
+        self.control_rate_hz = max(10.0, min(200.0, self.control_rate_hz))
+        self.dt = 1.0 / self.control_rate_hz
+        self.arm_p_gain = float(self.declare_parameter("arm_p_gain", 4.0).value)
+        self.arm_a_gain = float(self.declare_parameter("arm_a_gain", 2.0).value)
 
         self.prev_clutch = {"left": False, "right": False}
         self.human_zero = {"left": None, "right": None}
@@ -223,8 +224,11 @@ class FingerFootPoseNode(Node):
         self.prev_waist_state = None
 
         self.timer = self.create_timer(self.dt, self.timer_callback)
-        self.debug_timer = self.create_timer(0.1, self.debug_callback)
-        self.get_logger().info("Finger foot pose node started")
+        self.enable_debug_log = bool(self.declare_parameter("enable_debug_log", False).value)
+        self.debug_timer = None
+        if self.enable_debug_log:
+            self.debug_timer = self.create_timer(0.1, self.debug_callback)
+        self.get_logger().info(f"Finger foot pose node started: control_rate={self.control_rate_hz:.1f} Hz")
         self.get_logger().info("WebSocket input: 0.0.0.0:8765")
         self.get_logger().info("Hand bridge: /igris/hand/joint_states -> /igris_c/hand/targets")
         self.get_logger().info("Hand status: /igris_c/hand/status -> /igris/hand/status")
@@ -480,7 +484,7 @@ class FingerFootPoseNode(Node):
                 q_body_yaw = self.quat_from_rpy(0.0, 0.0, body_yaw_delta)
                 target_rot = self.normalize_quat(self.quat_multiply(q_body_yaw, vr_rot))
 
-            p_gain = 4.0
+            p_gain = self.arm_p_gain
             msg = TwistStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = self.base_frame
@@ -490,7 +494,7 @@ class FingerFootPoseNode(Node):
 
             prev_rot = self.prev_state[side]["rot"]
             wx, wy, wz = self.calc_angular_velocity(prev_rot, target_rot, self.dt)
-            a_gain = 2.0
+            a_gain = self.arm_a_gain
             msg.twist.angular.x = float(wx * a_gain)
             msg.twist.angular.y = float(wy * a_gain)
             msg.twist.angular.z = float(wz * a_gain)
@@ -882,12 +886,17 @@ class FingerFootPoseNode(Node):
         ws_age = None if shared_ws_last_time <= 0.0 else round(time.time() - shared_ws_last_time, 2)
         has_left = bool(shared_xr_data.get("left"))
         has_right = bool(shared_xr_data.get("right"))
+        xr_rate = shared_xr_data.get("xr_frame_rate")
+        xr_supported = shared_xr_data.get("xr_supported_frame_rates") or []
         self.get_logger().info(
-            "teleop_status ws_count=%d ws_age=%s xr L/R=%s/%s clutch_raw L/R=%s/%s "
+            "teleop_status ws_count=%d ws_age=%s xr_rate=%s xr_supported=%s "
+            "xr L/R=%s/%s clutch_raw L/R=%s/%s "
             "arm_orientation ang_base L=%s R=%s dom L/R=%s/%s mode L/R=%s/%s"
             % (
                 shared_ws_count,
                 ws_age,
+                xr_rate,
+                xr_supported,
                 has_left,
                 has_right,
                 shared_foot_clutch["left"],

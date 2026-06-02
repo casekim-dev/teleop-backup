@@ -66,9 +66,11 @@ void handStateCallback(const HandState &) {
 
 void handInitResponseCallback(const ServiceResponse &res) {
     g_init_response_count++;
-    std::cout << "[HandInit] response " << (res.success() ? "OK" : "FAIL")
-              << " request_id=" << res.request_id()
-              << " message=" << res.message() << std::endl;
+    if (std::getenv("HAND_DEBUG_LOG") != nullptr || !res.success()) {
+        std::cout << "[HandInit] response " << (res.success() ? "OK" : "FAIL")
+                  << " request_id=" << res.request_id()
+                  << " message=" << res.message() << std::endl;
+    }
 }
 
 int main(int argc, char **argv) {
@@ -139,10 +141,12 @@ int main(int argc, char **argv) {
         id_stream << active_motor_ids[i];
     }
 
+    const bool debug_log = std::getenv("HAND_DEBUG_LOG") != nullptr;
     RCLCPP_INFO(node->get_logger(), "SDK domain=%d", domain_id);
     RCLCPP_INFO(node->get_logger(), "Sub: /igris_c/hand/targets");
     RCLCPP_INFO(node->get_logger(), "Sub: rt/handstate, rt/service/hand_init/response");
     RCLCPP_INFO(node->get_logger(), "Pub: rt/handcmd (DDS HandCmd ids: %s)", id_stream.str().c_str());
+    RCLCPP_INFO(node->get_logger(), "Periodic hand debug log: %s", debug_log ? "enabled" : "disabled");
 
     const bool probe_mode = std::getenv("HAND_ID_PROBE") != nullptr;
     if (probe_mode) {
@@ -239,7 +243,8 @@ int main(int argc, char **argv) {
             g_handcmd_count++;
         }
 
-        if (count++ % 120 == 0) {
+        ++count;
+        if (debug_log && count % 120 == 0) {
             std::cout << "[HandCmd] cmds=" << g_handcmd_count.load()
                       << " handstate=" << g_handstate_count.load()
                       << " init_res=" << g_init_response_count.load()
